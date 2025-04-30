@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 from PIL import Image
 from tqdm import tqdm
@@ -58,33 +59,45 @@ if __name__ == '__main__':
         config=wandb_config,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(config.model.showo.llm_model_path, padding_side="left")
+    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained("./pretrained_models/"+config.model.showo.llm_model_path, padding_side="left")
 
     uni_prompting = UniversalPrompting(tokenizer, max_text_len=config.dataset.preprocessing.max_seq_length,
                                        special_tokens=("<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"),
                                        ignore_id=-100, cond_dropout_prob=config.training.cond_dropout_prob)
 
     vq_model = get_vq_model_class(config.model.vq_model.type)
-    vq_model = vq_model.from_pretrained(config.model.vq_model.vq_model_name).to(device)
+    vq_model = vq_model.from_pretrained("./pretrained_models/"+config.model.vq_model.vq_model_name).to(device)
     vq_model.requires_grad_(False)
     vq_model.eval()
 
     vision_tower_name = "openai/clip-vit-large-patch14-336"
     vision_tower =  CLIPVisionTower(vision_tower_name).to(device)
-    clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower_name)
+    clip_image_processor = CLIPImageProcessor.from_pretrained("./pretrained_models/"+vision_tower_name)
 
-    model = Showo.from_pretrained(config.model.showo.pretrained_model_path).to(device)
+    model = Showo.from_pretrained("./pretrained_models/"+config.model.showo.pretrained_model_path).to(device)
     model.eval()
-
+    
     temperature = 0.8  # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
     top_k = 1  # retain only the top_k most likely tokens, clamp others to have 0 probability
 
-    file_list = os.listdir(config.mmu_image_root)
+    import json
+
+    # RS data
+    with open(
+        '/home/zhangweiyu/RS_Generation_Understanding_LLM/Show-o/RS_dataset/rsgpt_dataset/RSIEval/annotations.json', 'r', encoding='utf-8') as file:
+        rs_gpt_dict = json.load(file)
+    
+    rs_gpt_dict_list = rs_gpt_dict["annotations"]
+    file_length = 10
+    file_list = rs_gpt_dict_list[:file_length]
+    file_paths = ["RS_dataset/rsgpt_dataset/RSIEval/images/" + file["filename"] for file in file_list]
+    
+    #file_list = os.listdir(config.mmu_image_root)
     responses = ['' for i in range(len(file_list))]
     images = []
     config.question = config.question.split(' *** ')
-    for i, file_name in enumerate(tqdm(file_list)):
+    for i, file_name in enumerate(tqdm(file_paths)):
         image_path = os.path.join(config.mmu_image_root, file_name)
         image_ori = Image.open(image_path).convert("RGB")
         image = image_transform(image_ori, resolution=config.dataset.params.resolution).to(device)
@@ -94,7 +107,7 @@ if __name__ == '__main__':
         pixel_values = clip_image_processor.preprocess(image_ori, return_tensors="pt")["pixel_values"][0]
 
         image_tokens = vq_model.get_code(image) + len(uni_prompting.text_tokenizer)
-        batch_size = 1
+        batch_size = 1 
 
         for question in config.question:
             if config.model.showo.w_clip_vit:
@@ -182,6 +195,20 @@ if __name__ == '__main__':
     images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
     pil_images = [Image.fromarray(image) for image in images]
 
-    wandb_images = [wandb.Image(image, caption=responses[i]) for i, image in enumerate(pil_images)]
-    wandb.log({"multimodal understanding": wandb_images}, step=0)
+    validation_prompts = [file["caption"] for file in file_list]
+    
+    wandb_images = []
+    for i, image in enumerate(pil_images):
+        # 创建组合caption，同时包含生成的和数据集的描述
+        combined_caption = f"Dataset: {validation_prompts[i]}\nGenerated: {responses[i]}"
+        
+        # 创建wandb图像对象
+        wandb_image = wandb.Image(image, caption=combined_caption)
+        wandb_images.append(wandb_image)
+
+    # 记录到wandb
+    wandb.log({"multimodal understanding": wandb_images})
+        
+    #wandb_images = [wandb.Image(image, caption=responses[i]) for i, image in enumerate(pil_images)]
+    #wandb.log({"multimodal understanding": wandb_images}, step=0)
 

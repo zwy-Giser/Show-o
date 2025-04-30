@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import os
-
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 from PIL import Image
 from tqdm import tqdm
@@ -52,19 +52,32 @@ if __name__ == '__main__':
         config=wandb_config,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(config.model.showo.llm_model_path, padding_side="left")
+    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained("./pretrained_models/"+config.model.showo.llm_model_path, padding_side="left")
 
     uni_prompting = UniversalPrompting(tokenizer, max_text_len=config.dataset.preprocessing.max_seq_length,
                                        special_tokens=("<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"),
                                        ignore_id=-100, cond_dropout_prob=config.training.cond_dropout_prob)
 
     vq_model = get_vq_model_class(config.model.vq_model.type)
-    vq_model = vq_model.from_pretrained(config.model.vq_model.vq_model_name).to(device)
+    vq_model = vq_model.from_pretrained("./pretrained_models/"+config.model.vq_model.vq_model_name).to(device)
     vq_model.requires_grad_(False)
     vq_model.eval()
 
-    model = Showo.from_pretrained(config.model.showo.pretrained_model_path).to(device)
+    model = Showo.from_pretrained("./pretrained_models/"+config.model.showo.pretrained_model_path).to(device)
+    
+    if config.experiment.resume_from_checkpoint:
+        dirs = os.listdir(config.experiment.output_dir)
+        dirs = [d for d in dirs if d.startswith("checkpoint")]
+        dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+        path = dirs[0] if len(dirs) > 0 else None
+        if path is not None:
+            path = os.path.join(config.experiment.output_dir, path)
+
+            print(f"Resuming from checkpoint {path}/unwrapped_model/pytorch_model.bin")
+            state_dict = torch.load(f'{path}/unwrapped_model/pytorch_model.bin', map_location="cpu")
+            model.load_state_dict(state_dict, strict=True)
+            del state_dict
     model.eval()
 
     mask_token_id = model.config.mask_token_id
@@ -72,6 +85,7 @@ if __name__ == '__main__':
     # load from users passed arguments
     if config.get("validation_prompts_file", None) is not None:
         config.dataset.params.validation_prompts_file = config.validation_prompts_file
+    print("validation_prompts_file", config.dataset.params.validation_prompts_file)
     config.training.batch_size = config.batch_size
     config.training.guidance_scale = config.guidance_scale
     config.training.generation_timesteps = config.generation_timesteps
@@ -287,8 +301,28 @@ if __name__ == '__main__':
         with open(config.dataset.params.validation_prompts_file, "r") as f:
             validation_prompts = f.read().splitlines()
 
+        # RS prompts
+        # RS data
+        import json
+        with open(
+            '/home/zhangweiyu/RS_Generation_Understanding_LLM/Show-o/RS_dataset/rsgpt_dataset/RSIEval/annotations.json', 'r', encoding='utf-8') as file:
+            rs_gpt_dict = json.load(file)
+        
+        rs_gpt_dict_list = rs_gpt_dict["annotations"]
+        file_length = 10
+        file_list = rs_gpt_dict_list[:file_length]
+        validation_prompts = [file["caption"] for file in file_list]
+        
+                #label images
+        file_paths = ["/home/zhangweiyu/RS_Generation_Understanding_LLM/Show-o/RS_dataset/rsgpt_dataset/RSIEval/images/" + file["filename"] for file in file_list]
+        images_labels = [Image.open(file) for file in file_paths]
+
+        
+        generated_images = []
+        
         for step in tqdm(range(0, len(validation_prompts), config.training.batch_size)):
             prompts = validation_prompts[step:step + config.training.batch_size]
+            pil_images_labels = images_labels[step:step + config.training.batch_size]
 
             image_tokens = torch.ones((len(prompts), config.model.showo.num_vq_tokens),
                                       dtype=torch.long, device=device) * mask_token_id
@@ -338,7 +372,24 @@ if __name__ == '__main__':
             images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
             images *= 255.0
             images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            
             pil_images = [Image.fromarray(image) for image in images]
+            
+            generated_images.extend(pil_images)
+        
+            wandb_images = []
+            for i in range(min(len(pil_images_labels), len(pil_images))):
+                # 水平拼接两张图片
+                combined_image = Image.new('RGB', (pil_images_labels[i].width + pil_images[i].width, max(pil_images[i].height, pil_images_labels[i].height)))
+                combined_image.paste(pil_images_labels[i], (0, 0))
+                combined_image.paste(pil_images[i], (pil_images_labels[i].width, 0))
 
-            wandb_images = [wandb.Image(image, caption=prompts[i]) for i, image in enumerate(pil_images)]
+                
+                wandb_images.append(wandb.Image(combined_image, caption=prompts[i]))
+
+            # 记录到 wandb
             wandb.log({"generated_images": wandb_images}, step=step)
+            
+            
+            #wandb_images = [wandb.Image(image, caption=prompts[i]) for i, image in enumerate(pil_images)]
+            #wandb.log({"generated_images": wandb_images}, step=step)

@@ -1,2 +1,6 @@
 RS_dataset
 RS_dataset
+*/__pycache__
+chpt*
+show-o-tuning-rs-only-512x512
+pretrained*
